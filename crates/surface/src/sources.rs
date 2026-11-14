@@ -56,6 +56,8 @@ pub const SHIPPED: &[(&str, &str)] = &[
     ("devices/launchpad_pro_mk3/lib/print.lua", include_str!("../lua/devices/launchpad_pro_mk3/lib/print.lua")),
     ("devices/maschine_jam/device.lua", include_str!("../lua/devices/maschine_jam/device.lua")),
     ("devices/maschine_jam/main.lua", include_str!("../lua/devices/maschine_jam/main.lua")),
+    ("devices/maschine_mk2/device.lua", include_str!("../lua/devices/maschine_mk2/device.lua")),
+    ("devices/maschine_mk2/main.lua", include_str!("../lua/devices/maschine_mk2/main.lua")),
     ("themes/maschine.lua", include_str!("../lua/themes/maschine.lua")),
     ("themes/palenight.lua", include_str!("../lua/themes/palenight.lua")),
     ("themes/solarized_dark.lua", include_str!("../lua/themes/solarized_dark.lua")),

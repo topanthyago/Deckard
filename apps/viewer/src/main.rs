@@ -4935,8 +4935,8 @@ impl App {
             sampling: self.sampling_surface_view(),
             ..Default::default()
         };
-        // (Only while BROWSE shows, or the JAM has the panel open: the results can be long.)
-        if self.surface.page() == "browse" || (self.jam_device.is_some() && self.browser.open) {
+        // Build browser results only while a controller or the app has BROWSE open; they can be long.
+        if self.surface.page() == "browse" || ((self.jam_device.is_some() || self.midi_devices.active()) && self.browser.open) {
             let b = self.browser.view();
             for name in &b.products {
                 plugin_pictures::ensure_browser_product(&self.surface, name);
@@ -6192,13 +6192,22 @@ impl App {
             };
         }
         asked.extend(self.midi_devices.poll(&view, now));
+        let mut acted = false;
         for a in asked {
             match a {
-                deckard_surface::device::Out::App(a) => self.surface_act(a),
+                deckard_surface::device::Out::App(a) => {
+                    self.surface_act(a);
+                    acted = true;
+                }
                 deckard_surface::device::Out::Print(p) => self.print_notes(&p),
                 deckard_surface::device::Out::Message(m) => self.status = m,
                 deckard_surface::device::Out::Midi { .. } => {}
             }
+        }
+        // The view passed to the script preceded its actions. Refresh promptly,
+        // including during a logic-only background pass.
+        if acted {
+            ctx.request_repaint();
         }
         let error = self.midi_devices.errors().into_iter().next();
         if error != self.midi_device_error {

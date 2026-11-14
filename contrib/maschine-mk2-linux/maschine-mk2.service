@@ -1,0 +1,14 @@
+[Unit]
+Description=Deckard Maschine MK2 MIDI and display bridge
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u %h/.local/share/deckard/maschine-mk2/launch.py %h/.local/bin/maschine
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

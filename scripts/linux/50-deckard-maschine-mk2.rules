@@ -1,0 +1,3 @@
+# Native Instruments Maschine Controller MK2 (17cc:1140), full-size model.
+# Permit the active local session to access the HID node used by the user bridge.
+KERNEL=="hidraw*", ATTRS{idVendor}=="17cc", ATTRS{idProduct}=="1140", MODE="0660", TAG+="uaccess"

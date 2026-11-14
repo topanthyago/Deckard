@@ -125,3 +125,25 @@ fn only_the_devices_own_files_reload_it() {
     std::fs::write(dir.join("lib/mine.lua"), "return {}").unwrap();
     assert!(d.reload(), "lib/ is shared");
 }
+
+#[test]
+fn maschine_mk2_is_shipped_and_runs_in_the_device_host() {
+    let found = devices(None);
+    let mk2 = found.iter().find(|d| d.id == "maschine_mk2").expect("the shipped MK2 script");
+    assert_eq!(mk2.drums, ["Pads MIDI"]);
+    assert_eq!(mk2.exclusive, ["controls"]);
+    let mut device = Device::new("maschine_mk2", None);
+    assert_eq!(device.error(), None);
+    device.open(&view(), Instant::now());
+    device.tick(&view(), Instant::now());
+    assert_eq!(device.error(), None);
+}
+
+#[test]
+fn maschine_mk2_controller_regressions() {
+    let lua = mlua::Lua::new();
+    let args = lua.create_table().unwrap();
+    args.set(1, concat!(env!("CARGO_MANIFEST_DIR"), "/lua/devices/maschine_mk2")).unwrap();
+    lua.globals().set("arg", args).unwrap();
+    lua.load(include_str!("../../../contrib/maschine-mk2-linux/test_controller.lua")).exec().unwrap();
+}

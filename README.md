@@ -1,5 +1,9 @@
 # DECKARD
 
+Linux Maschine MK2 support is available on this branch. See the
+[Maschine MK2 setup guide](contrib/maschine-mk2-linux/README.md) for building,
+USB access and controller mappings.
+
 DECKARD is a groovebox for your computer that works like NI's Maschine: scenes and
 patterns, a song arrangement, sixteen pads per group, a sampler, drum synths, effects
 and a mixer. It opens Maschine projects and saves them in Maschine's own format, so you

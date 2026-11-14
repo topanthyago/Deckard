@@ -33,3 +33,7 @@ venv/
 .vscode/
 /Maschine_*Manual*.pdf
 .superpowers/
+
+# Standalone Linux MK2 bridge build output and local device configuration.
+/contrib/maschine-mk2-linux/daemon/target/
+/contrib/maschine-mk2-linux/daemon/maschine.json

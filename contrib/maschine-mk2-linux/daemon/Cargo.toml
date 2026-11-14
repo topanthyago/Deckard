@@ -1,0 +1,31 @@
+[package]
+name = "maschine"
+version = "0.0.1"
+authors = ["William Light <wrl@illest.net>"]
+edition = "2021"
+# MEASURED 2026-09-20, not guessed: 1.85 cannot resolve this lock (icu_* and
+# idna_adapter want 1.86) and 1.86 builds it clean. Stated here so a too-old
+# toolchain says so in one line instead of listing eight transitive crates.
+rust-version = "1.86"
+
+[profile.release]
+lto = true
+
+[dependencies]
+nix = "0.26"
+hsl = "~0.1"
+# PINNED, 2026-09-03. This was `midi = "*"`: any future upload to crates.io
+# could change what the daemon is built from, and a build without the lock
+# file would silently take it.
+midi = "0.1.0"
+tinyosc = "0.0.3"
+hex = "0.4.3"
+tungstenite = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dependencies.alsa-seq]
+path = "alsa-seq"
+
+# The standalone GPL bridge is built separately from the Deckard workspace.
+[workspace]
