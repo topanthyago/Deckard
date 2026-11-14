@@ -8,13 +8,61 @@
 //! project's scene has for its group.
 
 use super::arrange::px;
-use super::build::{GROUP, set_text};
+use super::build::{GROUP, SOUND, set_text};
 use super::channel::SoundRoute;
 use super::{Document, Op, Target};
 use deckard_model::{AudioDest, AudioSource, ScSource};
 use mxprj::decode::{Obj, Value};
 
 impl Document {
+    /// Add empty sounds up to `minimum`, preserving existing sound identities,
+    /// routing and every pattern's events. Returns the number added.
+    pub fn ensure_sound_slots(&mut self, group: usize, minimum: usize) -> Result<usize, String> {
+        let ga = self.addresses.groups.get(group).ok_or("no such group")?.clone();
+        let existing = ga.sounds.len();
+        if existing >= minimum {
+            return Ok(0);
+        }
+        let sounds_path = self.field_path(&ga.group, &["sounds", "objects", "items"])?;
+        let configs_path = self.field_path(&ga.group, &["sound_configs", "items"])?;
+        let browse_path = self.field_path(&ga.group, &["quick_browse"])?;
+        let mut sounds = self.items(&sounds_path)?;
+        let mut configs = self.items(&configs_path)?;
+        let mut browse = match self.tree.at(&browse_path).cloned().ok_or("group without quick_browse")? {
+            Value::Obj(o) if o.type_name.is_empty() => o,
+            one => Obj { fields: vec![("sound0".into(), one)], ..Obj::default() },
+        };
+        let mut sound_ids = Vec::new();
+        for index in existing..minimum {
+            let (sound, id, config, handle) = self.build(|b| {
+                let sound = b.sound(index)?;
+                let id = sound.oid.ok_or("sound without id")?;
+                let config = Value::Obj(b.sound_config(index)?);
+                let handle = b.handles("sound", 1)?;
+                Ok((b.shared(SOUND, sound), id, config, handle))
+            })?;
+            sounds.push(sound);
+            configs.push(config);
+            browse.fields.push((format!("sound{index}"), handle));
+            sound_ids.push(id);
+        }
+        let mut ops = vec![
+            Op::Set { path: sounds_path, value: Value::List(sounds) },
+            Op::Set { path: configs_path, value: Value::List(configs) },
+            Op::Set { path: browse_path, value: Value::Obj(browse) },
+        ];
+        for pattern in ga.patterns.iter().chain(&ga.clip_patterns) {
+            let path = self.field_path(pattern, &["sound_sequences", "objects", "items"])?;
+            let mut entries = self.items(&path)?;
+            for &id in &sound_ids {
+                entries.push(self.build(|b| b.sound_sequence_entry(id))?);
+            }
+            ops.push(Op::Set { path, value: Value::List(entries) });
+        }
+        self.apply("Add Sound Slots", ops)?;
+        Ok(minimum - existing)
+    }
+
     /// A new empty group at the end of the group list; returns its index.
     pub fn add_group(&mut self) -> Result<usize, String> {
         let song = self.addresses.song.clone().ok_or("the project has no song")?;
@@ -196,6 +244,35 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use crate::Document;
+
+    #[test]
+    fn completing_an_eight_sound_group_preserves_events_and_saves() {
+        use crate::{Op, Target};
+        use deckard_model::{Note, PPQ};
+        use mxprj::decode::Value;
+
+        let mut d = Document::new_project().unwrap();
+        let path = d.addresses.groups[0].group.clone();
+        let Value::Obj(old) = d.tree.at(&path).cloned().unwrap() else { panic!("group") };
+        let mut short = d.build(|b| b.group(8)).unwrap();
+        short.oid = old.oid;
+        short.export = old.export;
+        d.apply("Test eight sounds", vec![Op::Set { path, value: Value::Obj(short) }]).unwrap();
+        d.add_pattern(0, 0, "Legacy").unwrap();
+        d.assign_pattern(0, 0, Some(0)).unwrap();
+        d.rename(Target::Sound(0, 0), "Original").unwrap();
+        let note = |sound| Note { sound, position: 0, length: PPQ / 4, pitch: 60, velocity: 100, probability: 100, expr: None };
+        d.add_note(0, 0, note(0)).unwrap();
+        assert_eq!(d.ensure_sound_slots(0, 16).unwrap(), 8);
+        assert_eq!(d.project().groups[0].sounds.len(), 16);
+        assert_eq!(d.project().groups[0].sounds[0].name, "Original");
+        d.add_note(0, 0, note(15)).unwrap();
+        let bytes = d.to_bytes().unwrap();
+        let reopened = Document::from_bytes(bytes, None).unwrap();
+        assert_eq!(reopened.project().groups[0].sounds.len(), 16);
+        assert_eq!(reopened.project().groups[0].patterns[0].notes, vec![note(0), note(15)]);
+        assert_eq!(reopened.project().scenes[0].patterns, [(0, 0)]);
+    }
 
     /// A new group comes last, named for its place, with 16 empty sounds; the project
     /// saves and opens again with it.

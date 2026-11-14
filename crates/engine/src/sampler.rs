@@ -831,8 +831,8 @@ impl Lofi {
     }
 }
 
-/// Voices a Sampler has room for from the start (more grow the list).
-const VOICE_ROOM: usize = 24;
+/// All voices the Sampler permits are reserved before playback.
+const VOICE_ROOM: usize = MAX_VOICES;
 
 #[derive(Clone, Copy)]
 struct Voice {
@@ -942,7 +942,7 @@ impl SamplerRt {
             mod_wheel: 0.0,
             bend: 0.0,
             pedal: false,
-            held: Vec::with_capacity(16),
+            held: Vec::with_capacity(128),
             glide: 0.0,
             glide_target: 0.0,
             glide_step: 0.0,
@@ -1102,18 +1102,25 @@ impl SamplerRt {
 
     /// Take over the voices and controller state of `old` (the same sound before a
     /// project change). Voices of zones that changed sample fade out.
-    pub fn adopt(&mut self, mut old: SamplerRt) {
-        if let (Some(new), Some(o)) = (self.audio.as_mut(), old.audio.take()) {
-            new.adopt(*o);
-            return;
+    pub fn adopt(&mut self, old: SamplerRt) {
+        drop(self.adopt_keep(old));
+    }
+
+    /// The replaced allocations return to the caller for off-thread drop.
+    pub fn adopt_keep(&mut self, mut old: SamplerRt) -> SamplerRt {
+        if let (Some(new), Some(o)) = (self.audio.as_mut(), old.audio.as_mut()) {
+            new.adopt_keep(o);
+            return old;
         }
         // The same synth keeps playing, with the new settings.
-        if let (Some(new), Some(o)) = (self.synth.as_mut(), old.synth.take()) {
-            if new.0 == o.0 {
-                *new = o;
-                new.1.set(&self.settings.synth);
+        if self.synth.is_some() && old.synth.is_some() {
+            if self.synth.as_ref().map(|s| s.0) == old.synth.as_ref().map(|s| s.0) {
+                std::mem::swap(&mut self.synth, &mut old.synth);
+                if let Some((_, synth, ..)) = self.synth.as_mut() {
+                    synth.set(&self.settings.synth);
+                }
             }
-            return;
+            return old;
         }
         let same = |a: &ZoneRt, b: &ZoneRt| Arc::ptr_eq(&a.sample, &b.sample);
         for v in old.voices.drain(..) {
@@ -1125,9 +1132,10 @@ impl SamplerRt {
         }
         self.clock = old.clock;
         (self.mod_wheel, self.bend, self.pedal) = (old.mod_wheel, old.bend, old.pedal);
-        self.held = old.held;
+        std::mem::swap(&mut self.held, &mut old.held);
         (self.glide, self.glide_target, self.glide_step, self.first_note) = (old.glide, old.glide_target, old.glide_step, old.first_note);
         self.lfo_phase = old.lfo_phase;
+        old
     }
 
     fn free_lfo_hz(&self) -> f64 {
@@ -1732,6 +1740,11 @@ mod tests {
         let limit = smp.settings.note_limit();
         for n in 0..VOICE_ROOM.min(limit + 4) as i64 {
             smp.note_on(n as u64 + 1, 40 + n, 100, &ctx);
+        }
+        // Even a rapid stack of the same note reaches the hard voice limit
+        // without growing the vector in the callback.
+        for n in 0..(MAX_VOICES + 16) {
+            smp.note_on(1000 + n as u64, 60, 100, &ctx);
         }
         assert_eq!(smp.voices.as_ptr(), buffer, "the voice list was not reallocated");
         let sounding = smp.voices.iter().filter(|v| v.fade.is_none()).count();

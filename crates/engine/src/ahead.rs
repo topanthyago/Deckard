@@ -107,6 +107,8 @@ pub(crate) enum JunkKind {
     Parts(Box<Parts>),
     Offs(Vec<(u64, u64, i64)>),
     Live(Vec<(u64, Ev)>),
+    Sampler(crate::sampler::SamplerRt),
+    Timeline(crate::Timeline),
 }
 
 /// What players send back to the audio thread.

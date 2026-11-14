@@ -86,6 +86,17 @@ pub struct NoteEvent {
     pub from: Option<usize>,
 }
 
+/// A note actually sent to an instrument, at an absolute output frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayedNote {
+    pub frame: u64,
+    pub group: usize,
+    pub sound: usize,
+    pub pitch: i64,
+    pub velocity: i64,
+    pub sequenced: bool,
+}
+
 /// Whether `e` is muted: its sound is, or (a link's note) the sound whose note played it.
 fn note_muted(muted: &[Vec<bool>], e: &NoteEvent) -> bool {
     let of = |s: usize| muted.get(e.group).and_then(|r| r.get(s)).copied().unwrap_or(false);
@@ -142,6 +153,13 @@ impl Timeline {
 /// the mode it plays, and the one for a mode it has queued.
 #[derive(Debug, Default)]
 pub struct Timelines(pub Vec<(Mode, Timeline)>);
+
+/// A prepared edit or scene launch waiting for the next bar.
+struct BarTimeline {
+    mode: Mode,
+    timeline: Timeline,
+    remaining_ticks: f64,
+}
 
 impl Timelines {
     /// The timelines of `modes` for `project`.
@@ -1960,6 +1978,15 @@ pub struct Engine {
     mode: Mode,
     /// What to play when the current pass ends (a scene launched while playing).
     queued: Option<(Mode, Timeline)>,
+    bar_timeline: Option<BarTimeline>,
+    gate_all: bool,
+    gate_group: Option<usize>,
+    gate_sounds: Option<u32>,
+    played_notes: Vec<PlayedNote>,
+    played_notes_overflow: bool,
+    trace_notes: bool,
+    /// Objects retired on the audio thread, returned by `take_junk`.
+    garbage: Vec<Junk>,
     /// A jump within the timeline: at tick `.0`, continue from tick `.1` (a section
     /// picked while the song plays).
     jump: Option<(i64, i64)>,
@@ -2002,6 +2029,8 @@ pub struct Engine {
     count_frame: u64,
     /// Note Repeat / Arp: held live notes feed it; it plays on the rate's grid.
     repeater: Option<repeat::Repeater>,
+    /// Reused when Note Repeat is off, so toggling it does not allocate.
+    repeat_spare: Option<repeat::Repeater>,
     repeat_buf: Vec<repeat::Fired>,
     /// MIDI input plug-ins, a slot per group, and what one just played.
     midi_inputs: Vec<Option<Box<dyn midi_input::MidiInput>>>,
@@ -2776,14 +2805,22 @@ impl Engine {
             timeline,
             mode,
             queued: None,
+            bar_timeline: None,
+            gate_all: false,
+            gate_group: None,
+            gate_sounds: None,
+            played_notes: Vec::with_capacity(project.groups.iter().map(|g| g.sounds.len()).sum::<usize>().saturating_mul(16).max(2048)),
+            played_notes_overflow: false,
+            trace_notes: false,
+            garbage: Vec::with_capacity(project.groups.iter().map(|g| g.sounds.len()).sum::<usize>().saturating_mul(2).max(256)),
             jump: None,
             samples,
             sounds,
             // Room for sounds that go away while they ring (no allocating on the audio
             // thread).
-            retired: Vec::with_capacity(64),
+            retired: Vec::with_capacity(project.groups.iter().map(|g| g.sounds.len()).sum::<usize>().saturating_mul(2).max(256)),
             instruments,
-            note_offs: Vec::with_capacity(256),
+            note_offs: Vec::with_capacity(project.groups.iter().map(|g| g.sounds.len()).sum::<usize>().saturating_mul(128).max(256)),
             live: Vec::with_capacity(LIVE_ROOM),
             stale: false,
             time: 0,
@@ -2801,6 +2838,7 @@ impl Engine {
             prehear: prehear::Prehear::default(),
             recording: false,
             repeater: None,
+            repeat_spare: Some(repeat::Repeater::new(deckard_model::Arp::default(), repeat::RepeatMode::NoteRepeat)),
             repeat_buf: Vec::with_capacity(256),
             midi_inputs: (0..midi_input::SLOTS).map(|_| None).collect(),
             midi_input_out: Vec::with_capacity(midi_input::OUT_ROOM),
@@ -2834,7 +2872,7 @@ impl Engine {
             pass: 0,
             #[cfg(test)]
             fired: Vec::new(),
-            meters: Vec::new(),
+            meters: project.groups.iter().map(|g| vec![(0.0, 0.0); g.sounds.len()]).collect(),
             tap: None,
             tap_pending: Vec::new(),
             tap_total: 0,
@@ -2850,13 +2888,13 @@ impl Engine {
             reuse,
             keep_timeline,
             group_swaps: Vec::new(),
-            tap_block: Vec::new(),
+            tap_block: Vec::with_capacity(JOB_FRAMES * 2),
             fx,
             modulating: false,
             bus_order: bus_order(&buses),
             buses,
             master_fx,
-            sc_bufs: vec![Vec::new(); sc_index.len()],
+            sc_bufs: (0..sc_index.len()).map(|_| Vec::with_capacity(JOB_FRAMES * 2)).collect(),
             midi_routes: midi::out_routes(project),
             sound_muted: project
                 .groups
@@ -2871,7 +2909,7 @@ impl Engine {
             silent: project.groups.iter().map(|g| vec![false; g.sounds.len()]).collect(),
             pads: pads::Pads::of(project),
             midi_tx: None,
-            midi_offs: Vec::with_capacity(256),
+            midi_offs: Vec::with_capacity(project.groups.iter().map(|g| g.sounds.len()).sum::<usize>().saturating_mul(128).max(256)),
             mpe: std::collections::HashMap::new(),
             batching: false,
             touch: Vec::with_capacity(mod_rt::VOICES),
@@ -2957,20 +2995,31 @@ impl Engine {
         let ticks = self.position();
         // Sounding Sampler voices carry over to the same sounds; sounds that went away
         // fade out.
-        for (g, row) in std::mem::take(&mut self.sounds).into_iter().enumerate() {
-            for (si, old) in row.into_iter().enumerate() {
-                let Some(mut old) = old else { continue };
+        for (g, row) in self.sounds.iter_mut().enumerate() {
+            for (si, slot) in row.iter_mut().enumerate() {
+                let Some(mut old) = slot.take() else { continue };
                 match fresh.sounds.get_mut(g).and_then(|r| r.get_mut(si)).and_then(Option::as_mut) {
-                    Some(new) => new.adopt(old),
-                    None if old.voices() > 0 => {
-                        // It rings out at the level it had (now outside the mixer).
+                    Some(new) => {
+                        old = new.adopt_keep(old);
+                        if old.voices() > 0 {
+                            old.fade_all();
+                            self.retired.push(old);
+                        } else {
+                            // The returned engine owns this old allocation.
+                            *slot = Some(old);
+                        }
+                    }
+                    None => {
+                        // It rings out at the level it had, then is returned for
+                        // destruction off the audio thread, even if already silent.
                         if let Some(b) = self.bufs.get(g).and_then(|r| r.get(si)).and_then(Option::as_deref) {
                             old.mix = b.ramps[0].now;
                         }
-                        old.fade_all();
+                        if old.voices() > 0 {
+                            old.fade_all();
+                        }
                         self.retired.push(old);
                     }
-                    None => {}
                 }
             }
         }
@@ -3040,8 +3089,7 @@ impl Engine {
         std::mem::swap(&mut self.job_ptrs, &mut fresh.job_ptrs);
         self.numerator = fresh.numerator;
         self.denominator = fresh.denominator;
-        // Meters of the new shape, made here rather than on the audio thread.
-        fresh.meters = self.sounds.iter().map(|g| vec![(0.0, 0.0); g.len()]).collect();
+        // The new shape was prepared by Engine::new, outside the callback.
         std::mem::swap(&mut self.meters, &mut fresh.meters);
         self.tempo = fresh.tempo;
         self.song_tempo = fresh.song_tempo;
@@ -3226,6 +3274,82 @@ impl Engine {
         self.keep_timeline
     }
 
+    /// Keep the playing timeline when this prepared engine is adopted.
+    /// An embedding host can then launch its new timeline at a bar boundary.
+    pub fn keep_timelines_for_adoption(&mut self) {
+        self.keep_timeline = true;
+    }
+
+    /// Whether an adoption can retire every current Sampler without growing
+    /// the preallocated retirement storage on the audio thread.
+    pub fn can_adopt(&self) -> bool {
+        let sounds = self.sounds.iter().flatten().filter(|s| s.is_some()).count();
+        self.retired.capacity().saturating_sub(self.retired.len()) >= sounds
+    }
+
+    /// Gate sequenced events for a group, or for all groups. Live pads,
+    /// keyboard and Note Repeat still play through their ordinary paths. The
+    /// host must not use render-ahead while driving this real-time gate.
+    pub fn set_sequence_gate(&mut self, group: Option<usize>, all: bool) {
+        self.set_sequence_gate_sounds(group, None, all);
+    }
+
+    /// As `set_sequence_gate`, optionally gating only sounds whose bits are
+    /// set. Sounds outside the mask and live notes continue playing.
+    pub fn set_sequence_gate_sounds(&mut self, group: Option<usize>, sounds: Option<u32>, all: bool) {
+        if all && !self.gate_all {
+            for sound in self.sounds.iter_mut().flatten().flatten() {
+                sound.fade_all();
+            }
+            for instrument in self.instruments.iter().flatten().flatten() {
+                if let Ok(mut plugin) = instrument.plugin.try_lock() {
+                    plugin.all_notes_off();
+                }
+            }
+        }
+        self.gate_group = group;
+        self.gate_sounds = sounds;
+        self.gate_all = all;
+    }
+
+    /// Absolute output frame at the beginning of the next process call.
+    pub fn output_frame(&self) -> u64 {
+        self.time
+    }
+
+    /// Clear the bounded instrument-note trace before rendering a buffer.
+    pub fn clear_played_notes(&mut self) {
+        self.played_notes.clear();
+        self.played_notes_overflow = false;
+        self.trace_notes = true;
+    }
+
+    pub fn played_notes(&self) -> &[PlayedNote] {
+        &self.played_notes
+    }
+
+    pub fn played_notes_overflow(&self) -> bool {
+        self.played_notes_overflow
+    }
+
+    fn note_played(&mut self, event: NoteEvent) {
+        if !self.trace_notes {
+            return;
+        }
+        if self.played_notes.len() < self.played_notes.capacity() {
+            self.played_notes.push(PlayedNote {
+                frame: self.time,
+                group: event.group,
+                sound: event.sound,
+                pitch: event.pitch,
+                velocity: event.velocity,
+                sequenced: self.from_timeline,
+            });
+        } else {
+            self.played_notes_overflow = true;
+        }
+    }
+
     /// What is playing now.
     pub fn mode(&self) -> Mode {
         self.mode
@@ -3233,7 +3357,42 @@ impl Engine {
 
     /// What will play after the current pass, if anything was queued.
     pub fn queued(&self) -> Option<Mode> {
-        self.queued.as_ref().map(|(m, _)| *m)
+        self.bar_timeline.as_ref().map(|b| b.mode).or_else(|| self.queued.as_ref().map(|(m, _)| *m))
+    }
+
+    /// Launch a timeline made off-thread on the next bar. Unlike `queue`,
+    /// the same scene can be queued to change one Group's pattern. `timeline`
+    /// receives any superseded pending timeline to be dropped off-thread.
+    pub fn queue_timeline_at_bar(&mut self, mode: Mode, timeline: &mut Timeline) {
+        if let Some(pending) = self.bar_timeline.as_mut() {
+            pending.mode = mode;
+            std::mem::swap(&mut pending.timeline, timeline);
+            return;
+        }
+        let bar = self.quantum() * PPQ as f64;
+        let remaining_ticks = if self.sequencing { bar - self.position().rem_euclid(bar) } else { 0.0 };
+        self.bar_timeline = Some(BarTimeline { mode, timeline: std::mem::take(timeline), remaining_ticks });
+    }
+
+    fn commit_bar_timeline(&mut self) -> bool {
+        let tolerance = 0.5 / self.samples_per_tick() + 1e-9;
+        if !self.bar_timeline.as_ref().is_some_and(|pending| !self.sequencing || pending.remaining_ticks <= tolerance)
+            || self.garbage.len() == self.garbage.capacity()
+        {
+            return false;
+        }
+        let pending = self.bar_timeline.take().expect("checked");
+        let old_position = self.position();
+        let keep_position = pending.mode == self.mode;
+        let old = std::mem::replace(&mut self.timeline, pending.timeline);
+        self.garbage.push(Junk(ahead::JunkKind::Timeline(old)));
+        self.mode = pending.mode;
+        let length = self.timeline.length as f64;
+        let position = if keep_position && length > 0.0 { old_position.rem_euclid(length) } else { 0.0 };
+        self.frame = (position * self.samples_per_tick()).round().max(0.0) as u64;
+        self.next = self.timeline.events.partition_point(|event| (event.tick as f64) < position - 1e-6);
+        self.pass += 1;
+        true
     }
 
     /// Switch to `mode` when the current pass (scene, pattern or song) ends, as
@@ -3396,7 +3555,7 @@ impl Engine {
     }
 
     /// A clock sets the tempo (Link, incoming MIDI clock): scenes' own tempos don't count.
-    pub(crate) fn set_followed(&mut self, on: bool) {
+    pub fn set_followed(&mut self, on: bool) {
         self.followed = on;
     }
 
@@ -3861,7 +4020,7 @@ impl Engine {
 
     /// Something to free off the audio thread (what players sent back).
     pub fn take_junk(&mut self) -> Option<Junk> {
-        self.ahead.as_mut()?.junk.pop()
+        self.garbage.pop().or_else(|| self.ahead.as_mut()?.junk.pop())
     }
 
     /// Sound (`g`, `s`)'s player, when it renders the sound (ahead, or until it hands
@@ -4259,8 +4418,18 @@ impl Engine {
                 r.arp = arp;
                 r.mode = mode;
             }
-            (Some((arp, mode)), None) => self.repeater = Some(repeat::Repeater::new(arp, mode)),
-            (None, _) => self.repeater = None,
+            (Some((arp, mode)), None) => {
+                let mut r = self.repeat_spare.take().unwrap_or_else(|| repeat::Repeater::new(arp.clone(), mode));
+                r.arp = arp;
+                r.mode = mode;
+                self.repeater = Some(r);
+            }
+            (None, _) => {
+                if let Some(mut r) = self.repeater.take() {
+                    r.clear();
+                    self.repeat_spare = Some(r);
+                }
+            }
         }
     }
 
@@ -4677,6 +4846,11 @@ impl Engine {
         let mut end = self.frame_of(self.timeline.length);
         let mut done = 0;
         while done < frames {
+            if self.commit_bar_timeline() {
+                self.follow_scene_tempo();
+                tps = 1.0 / self.samples_per_tick();
+                end = self.frame_of(self.timeline.length);
+            }
             if self.follow_scene_tempo() {
                 tps = 1.0 / self.samples_per_tick();
                 end = self.frame_of(self.timeline.length);
@@ -4698,7 +4872,10 @@ impl Engine {
                     }
                     let idx = self.next;
                     self.next += 1;
-                    let plays = chance(e.probability, idx, self.timeline.chance_pass(&e, self.pass), self.rng);
+                    let group_gated =
+                        self.gate_group == Some(e.group) && self.gate_sounds.is_none_or(|mask| e.sound < 32 && mask & (1 << e.sound) != 0);
+                    let gated = self.gate_all || group_gated;
+                    let plays = !gated && chance(e.probability, idx, self.timeline.chance_pass(&e, self.pass), self.rng);
                     #[cfg(test)]
                     self.fired.push((self.time, e.tick, e.sound, e.pitch, plays));
                     if plays {
@@ -4743,6 +4920,11 @@ impl Engine {
                     target = target.min(self.frame_of(at));
                 }
                 until = until.min(target.saturating_sub(self.frame).max(1));
+                if let Some(pending) = &self.bar_timeline {
+                    if pending.remaining_ticks > 1e-6 {
+                        until = until.min((pending.remaining_ticks / tps).round().max(1.0) as u64);
+                    }
+                }
             }
             if let Some(at) = self.live.iter().map(|o| o.0).min() {
                 until = until.min(at.saturating_sub(self.time).max(1));
@@ -4814,6 +4996,9 @@ impl Engine {
             self.clock_span(until as u64);
             if self.sequencing {
                 self.frame += until as u64;
+                if let Some(pending) = self.bar_timeline.as_mut() {
+                    pending.remaining_ticks -= until as f64 * tps;
+                }
             }
             // Waiting for a clock's bar, then the count-in; their end: the song plays
             // from the next frame.
@@ -5222,6 +5407,9 @@ impl Engine {
                 };
                 self.send_live(e.group, e.sound, ev);
             }
+            if e.midi.is_none() {
+                self.note_played(e);
+            }
             return;
         }
         if let Some(kind) = e.midi {
@@ -5245,13 +5433,19 @@ impl Engine {
             }
             // Other threads hold an instance only for moments (a parameter, a note), so
             // the audio thread waits for it rather than drop the note.
-            if let Ok(mut p) = inst.plugin.lock() {
+            let played = if let Ok(mut p) = inst.plugin.lock() {
                 p.note_on(e.pitch, e.velocity);
                 self.note_offs.retain(|o| !(o.1 == e.group && o.2 == e.sound && o.3 == e.pitch));
                 if e.length != HELD {
                     let gate = ((e.length.max(1) as f64) / tps).max(1.0) as u64;
                     self.note_offs.push((self.time + gate, e.group, e.sound, e.pitch, 0));
                 }
+                true
+            } else {
+                false
+            };
+            if played {
+                self.note_played(e);
             }
             return;
         }
@@ -5260,9 +5454,13 @@ impl Engine {
         self.clock += 1;
         let id = self.clock;
         snd.note_on(id, e.pitch, e.velocity.clamp(0, 127), &ctx);
+        let sounded = snd.voices() > 0;
         if e.length != HELD {
             let gate = ((e.length.max(1) as f64) / tps).max(1.0) as u64;
             self.note_offs.push((self.time + gate, e.group, e.sound, e.pitch, id));
+        }
+        if sounded {
+            self.note_played(e);
         }
     }
 
@@ -5548,7 +5746,15 @@ impl Engine {
                 for smp in &mut self.retired {
                     smp.render(out);
                 }
-                self.retired.retain(|s| s.voices() > 0);
+                let mut i = 0;
+                while i < self.retired.len() {
+                    if self.retired[i].voices() == 0 && self.garbage.len() < self.garbage.capacity() {
+                        let sampler = self.retired.swap_remove(i);
+                        self.garbage.push(Junk(ahead::JunkKind::Sampler(sampler)));
+                    } else {
+                        i += 1;
+                    }
+                }
             }
             for &(g, s) in &self.job_list {
                 let Some(b) = self.bufs[g][s].as_deref_mut() else { continue };
@@ -5867,7 +6073,7 @@ impl SoundBufs {
             inst_out: false,
             smp_gain,
             ramps: [GainRamp::default(); 2],
-            inp: Vec::new(),
+            inp: Vec::with_capacity(JOB_FRAMES * 2),
             inp_on: false,
         }
     }
@@ -6810,6 +7016,111 @@ mod tests {
         let onsets: Vec<usize> = (0..6000).filter(|&i| out[i * 2] > 0.5).collect();
         assert_eq!(onsets, [0, 500, 1000, 1500, 2000, 3000, 4000, 5000]);
         assert_eq!((e.mode(), e.queued()), (Mode::Scene(1), None));
+    }
+
+    #[test]
+    fn a_new_timeline_for_the_current_scene_starts_on_the_next_bar() {
+        let mut p = project();
+        let mut e = click_engine_for(&p, 1000);
+        e.jump(&p, Mode::Scene(0));
+        e.looping = true;
+        let mut out = vec![0f32; 2 * 4000];
+        e.process(&mut out[..2 * 700]);
+        p.groups[0].patterns[0].notes.retain(|n| n.position % (2 * PPQ) == 0);
+        let mut next = timeline(&p, Mode::Scene(0));
+        e.queue_timeline_at_bar(Mode::Scene(0), &mut next);
+        assert_eq!(e.queued(), Some(Mode::Scene(0)));
+        e.process(&mut out[2 * 700..]);
+        let onsets: Vec<usize> = (0..4000).filter(|&i| out[i * 2] > 0.5).collect();
+        assert_eq!(onsets, [0, 500, 1000, 1500, 2000, 3000]);
+        assert_eq!(e.queued(), None);
+        assert!(e.take_junk().is_some(), "old timeline is returned for off-thread drop");
+    }
+
+    #[test]
+    fn a_bar_launch_can_be_replaced_and_applies_when_stopped() {
+        let p = project();
+        let mut e = click_engine_for(&p, 1000);
+        e.jump(&p, Mode::Scene(0));
+        e.process(&mut vec![0.0; 200]);
+        let mut first = timeline(&p, Mode::Scene(0));
+        let expected = first.events.len();
+        e.queue_timeline_at_bar(Mode::Scene(0), &mut first);
+        let mut second = Timeline { length: 4 * PPQ, ..Timeline::default() };
+        e.queue_timeline_at_bar(Mode::Scene(0), &mut second);
+        assert_eq!(second.events.len(), expected, "superseded timeline returned to caller");
+        e.stop();
+        e.process(&mut [0.0; 2]);
+        assert!(e.timeline().events.is_empty(), "stopped launch applies without waiting a bar");
+        assert!(e.take_junk().is_some());
+    }
+
+    #[test]
+    fn a_bar_launch_tracks_a_tempo_change() {
+        let mut p = project();
+        let mut e = click_engine_for(&p, 1000);
+        e.jump(&p, Mode::Scene(0));
+        e.looping = true;
+        let mut out = vec![0f32; 2 * 2000];
+        e.process(&mut out[..2 * 700]);
+        p.groups[0].patterns[0].notes.retain(|n| n.position % (2 * PPQ) == 0);
+        let mut next = timeline(&p, Mode::Scene(0));
+        e.queue_timeline_at_bar(Mode::Scene(0), &mut next);
+        e.set_tempo(240.0);
+        e.process(&mut out[2 * 700..]);
+        let onsets: Vec<usize> = (0..2000).filter(|&i| out[i * 2] > 0.5).collect();
+        assert_eq!(onsets, [0, 500, 850, 1100, 1350, 1850]);
+    }
+
+    #[test]
+    fn sequence_gate_preserves_other_groups_and_live_pads() {
+        let mut p = project();
+        let second = p.groups[0].sounds[0].clone();
+        p.groups[0].sounds.push(second);
+        p.groups[0].patterns[0].notes.push(Note {
+            sound: 1,
+            pitch: 62,
+            position: 0,
+            length: PPQ / 4,
+            velocity: 127,
+            probability: 100,
+            expr: None,
+        });
+        let mut other = p.groups[0].clone();
+        for note in &mut other.patterns[0].notes {
+            note.pitch = 61;
+        }
+        p.groups.push(other);
+        p.scenes[0].patterns.push((1, 0));
+        let mut e = click_engine_for(&p, 1000);
+        e.jump(&p, Mode::Scene(0));
+        e.set_sequence_gate_sounds(Some(0), Some(1), false);
+        e.clear_played_notes();
+        e.schedule(0, Live::NoteOn { group: 0, sound: 0, pitch: 64, velocity: 100, length: PPQ / 4 });
+        let mut out = [0.0; 2];
+        e.process(&mut out);
+        assert!(e.fired.iter().any(|(_, _, _, pitch, plays)| *pitch == 60 && !plays), "focused sequence gated");
+        assert!(e.fired.iter().any(|(_, _, _, pitch, plays)| *pitch == 61 && *plays), "other group still sequenced");
+        assert!(e.fired.iter().any(|(_, _, _, pitch, plays)| *pitch == 62 && *plays), "unmasked sound still sequenced");
+        assert!(e.played_notes().iter().any(|n| n.group == 0 && n.pitch == 64 && !n.sequenced), "live pad still reaches instrument");
+        assert!(!e.played_notes_overflow());
+        assert_eq!(e.output_frame(), 1);
+    }
+
+    #[test]
+    fn adopting_returns_old_sampler_storage_and_keeps_the_new_meter_shape() {
+        let p = project();
+        let mut playing = click_engine_for(&p, 1000);
+        playing.note_on(0, 0, 60, 127, PPQ);
+        let mut fresh = click_engine_for(&p, 1000);
+        fresh.sounds[0][0].as_mut().unwrap().zones[0].sample = playing.sounds[0][0].as_ref().unwrap().zones[0].sample.clone();
+        let new_meters = fresh.meters.as_ptr();
+        assert!(playing.can_adopt());
+        let mut timelines = Timelines::of(&p, &[playing.mode()]);
+        let old = playing.adopt_with(fresh, &mut timelines);
+        assert_eq!(playing.meters.as_ptr(), new_meters, "meter storage came from prepared engine");
+        assert!(old.sounds[0][0].is_some(), "old sampler storage is returned off-thread");
+        assert!(playing.sounds[0][0].as_ref().unwrap().voices() > 0, "sounding voice carries on");
     }
 
     #[test]

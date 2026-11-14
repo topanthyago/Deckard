@@ -470,13 +470,19 @@ impl<'t> Builder<'t> {
         let pair_class = "std::pair<NI::MASCHINE::DATA::Sound const* const, std::shared_ptr<NI::MASCHINE::DATA::SequenceReference>>";
         let mut entries = Vec::new();
         for &snd in sounds {
-            let mut e = self.blank(pair_class)?;
-            *e.get_mut("sound").ok_or("entry without sound")? = Value::Ref(snd);
-            entries.push(Value::Obj(e));
+            entries.push(self.sound_sequence_entry(snd)?);
         }
         let v = self.item_version(pair_class);
         push_items(obj_mut(obj_mut(&mut p, "sound_sequences")?, "objects")?, entries, v)?;
         self.map_entry(PATTERN, id, p)
+    }
+
+    /// A pattern's empty event-sequence reference for one sound.
+    pub(crate) fn sound_sequence_entry(&mut self, sound: u64) -> Result<Value, String> {
+        let class = "std::pair<NI::MASCHINE::DATA::Sound const* const, std::shared_ptr<NI::MASCHINE::DATA::SequenceReference>>";
+        let mut entry = self.blank(class)?;
+        *entry.get_mut("sound").ok_or("entry without sound")? = Value::Ref(sound);
+        Ok(Value::Obj(entry))
     }
 
     /// A `sections` entry `key` playing the scene with id `scene`.

@@ -140,6 +140,25 @@ fn maschine_mk2_is_shipped_and_runs_in_the_device_host() {
 }
 
 #[test]
+fn maschine_mk2_repaint_preserves_the_focused_step_editor() {
+    let mut device = Device::new("maschine_mk2", None);
+    let v = view();
+    let now = Instant::now();
+    device.open(&v, now);
+    device.midi("controls", &[0xb0, 26, 127], &v, now);
+    device.midi("controls", &[0xb0, 26, 0], &v, now);
+    device.tick(&v, now);
+    device.tick(&v, now);
+    assert!(device.midi("controls", &[0xf0, 0x7d, 0x44, 0x49, 0xf7], &v, now).is_empty());
+    let repaint = device.tick(&v, now);
+    let clears = repaint.iter().filter(|event| matches!(event, Out::Midi { role, bytes } if role == "controls" && bytes.len() == 7 && bytes[..5] == [0xf0,0x7d,0x44,0x47,0])).count();
+    assert_eq!(clears, 2, "both LCDs redraw after an overlay");
+    let pad = device.midi("controls", &[0x90, 36, 100], &v, now);
+    assert!(pad.iter().any(|event| matches!(event, Out::App(Action::StepToggle { .. }))), "PATTERN remains the step editor");
+    assert_eq!(device.error(), None);
+}
+
+#[test]
 fn maschine_mk2_controller_regressions() {
     let lua = mlua::Lua::new();
     let args = lua.create_table().unwrap();

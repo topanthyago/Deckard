@@ -63,7 +63,17 @@ pub struct Repeater {
 
 impl Repeater {
     pub fn new(arp: Arp, mode: RepeatMode) -> Repeater {
-        Repeater { arp, mode, held: Vec::new(), down: Vec::new(), latched: false, next_at: None, step: 0, note_i: 0, seq_i: 0 }
+        Repeater {
+            arp,
+            mode,
+            held: Vec::with_capacity(2048),
+            down: Vec::with_capacity(2048),
+            latched: false,
+            next_at: None,
+            step: 0,
+            note_i: 0,
+            seq_i: 0,
+        }
     }
 
     /// Whether anything plays.

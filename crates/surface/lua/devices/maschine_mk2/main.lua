@@ -950,6 +950,11 @@ end
 
 function M.midi(role, bytes)
   if role ~= "controls" then return end
+  -- The host requests a full repaint after it reconnects a display.
+  if #bytes == 5 and bytes[1] == 0xf0 and bytes[2] == 0x7d and bytes[3] == 0x44 and bytes[4] == 0x49 and bytes[5] == 0xf7 then
+    layout, regions, wave_columns = nil, {}, {}
+    return
+  end
   local status = (bytes[1] or 0) & 0xf0
   local key, value = bytes[2] or 0, bytes[3] or 0
   local s = deckard.state()

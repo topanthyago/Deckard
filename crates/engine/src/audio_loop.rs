@@ -162,7 +162,12 @@ impl LoopRt {
     }
 
     /// Keep `old`'s place (the same sound before an edit), if it plays the same take.
-    pub fn adopt(&mut self, old: LoopRt) {
+    pub fn adopt(&mut self, mut old: LoopRt) {
+        self.adopt_keep(&mut old);
+    }
+
+    /// As `adopt`, leaving replaced allocations in `old` for off-thread drop.
+    pub fn adopt_keep(&mut self, old: &mut LoopRt) {
         self.cued = old.cued;
         self.gate = old.gate;
         self.bend = old.bend;
@@ -171,7 +176,7 @@ impl LoopRt {
         let take = old.cued.map(|c| c.0);
         let kept = take.is_some_and(|t| old.takes.get(t).zip(self.takes.get(t)).is_some_and(|(a, b)| same(a, b)));
         if kept && old.settings.engine == self.settings.engine {
-            self.stretch = old.stretch;
+            std::mem::swap(&mut self.stretch, &mut old.stretch);
             self.feed = old.feed;
             self.synced = old.synced;
         }
