@@ -3875,6 +3875,12 @@ impl Engine {
         );
     }
 
+    /// A host-generated fill note at the current frame. It goes through the
+    /// pad's choke/link routing but is not written into a live recording.
+    pub fn note_on_generated(&mut self, group: usize, sound: usize, pitch: i64, velocity: i64, length: i64) {
+        self.hit_pads(group, sound, pitch, |engine, sound, pitch| engine.note_on(group, sound, pitch, velocity, length));
+    }
+
     /// Start a note now that sounds until [`Engine::note_release`] (a key held down).
     pub fn note_hold(&mut self, group: usize, sound: usize, pitch: i64, velocity: i64) {
         self.note_on(group, sound, pitch, velocity, HELD);
@@ -7105,6 +7111,19 @@ mod tests {
         assert!(e.played_notes().iter().any(|n| n.group == 0 && n.pitch == 64 && !n.sequenced), "live pad still reaches instrument");
         assert!(!e.played_notes_overflow());
         assert_eq!(e.output_frame(), 1);
+    }
+
+    #[test]
+    fn generated_fill_plays_without_entering_recording() {
+        let mut e = click_engine(1000);
+        e.set_recording(true);
+        e.clear_played_notes();
+        e.note_on_generated(0, 0, 60, 100, PPQ / 4);
+        let mut out = [0.0; 2];
+        e.process(&mut out);
+        assert!(out[0] > 0.0, "generated note sounds");
+        assert!(e.played_notes().iter().any(|note| note.sound == 0));
+        assert!(e.take_recorded().is_empty(), "fill does not write a recorded note");
     }
 
     #[test]
