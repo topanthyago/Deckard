@@ -86,6 +86,14 @@ pub struct NoteEvent {
     pub from: Option<usize>,
 }
 
+/// A host's real-time variation of a sequenced note. It may suppress the
+/// note or return its new velocity; pitch, timing, length, routing and
+/// expression remain the original event's. Implementations must not allocate,
+/// block, perform I/O or lock on the audio thread.
+pub trait SequenceTransform: Send {
+    fn note(&mut self, note: &NoteEvent, context: &[u64; 16]) -> Option<i64>;
+}
+
 /// A note actually sent to an instrument, at an absolute output frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayedNote {
@@ -1982,6 +1990,8 @@ pub struct Engine {
     gate_all: bool,
     gate_group: Option<usize>,
     gate_sounds: Option<u32>,
+    sequence_transform: Option<Box<dyn SequenceTransform>>,
+    sequence_transform_context: [u64; 16],
     played_notes: Vec<PlayedNote>,
     played_notes_overflow: bool,
     trace_notes: bool,
@@ -2809,6 +2819,8 @@ impl Engine {
             gate_all: false,
             gate_group: None,
             gate_sounds: None,
+            sequence_transform: None,
+            sequence_transform_context: [0; 16],
             played_notes: Vec::with_capacity(project.groups.iter().map(|g| g.sounds.len()).sum::<usize>().saturating_mul(16).max(2048)),
             played_notes_overflow: false,
             trace_notes: false,
@@ -3310,6 +3322,18 @@ impl Engine {
         self.gate_group = group;
         self.gate_sounds = sounds;
         self.gate_all = all;
+    }
+
+    /// Install a host transform before audio starts. Returns the previous one
+    /// so it can be destroyed off the audio thread. A host driving this in
+    /// real time must not use render-ahead predictions.
+    pub fn set_sequence_transform(&mut self, transform: Option<Box<dyn SequenceTransform>>) -> Option<Box<dyn SequenceTransform>> {
+        std::mem::replace(&mut self.sequence_transform, transform)
+    }
+
+    /// Replace the transform's small copy-only context without allocation.
+    pub fn set_sequence_transform_context(&mut self, context: [u64; 16]) {
+        self.sequence_transform_context = context;
     }
 
     /// Absolute output frame at the beginning of the next process call.
@@ -4872,7 +4896,8 @@ impl Engine {
             }
             if self.sequencing {
                 // Events due now.
-                while let Some(&e) = self.timeline.events.get(self.next) {
+                while let Some(&original) = self.timeline.events.get(self.next) {
+                    let mut e = original;
                     if self.frame_of(e.tick) > self.frame {
                         break;
                     }
@@ -4881,7 +4906,17 @@ impl Engine {
                     let group_gated =
                         self.gate_group == Some(e.group) && self.gate_sounds.is_none_or(|mask| e.sound < 32 && mask & (1 << e.sound) != 0);
                     let gated = self.gate_all || group_gated;
-                    let plays = !gated && chance(e.probability, idx, self.timeline.chance_pass(&e, self.pass), self.rng);
+                    let mut plays = !gated && chance(e.probability, idx, self.timeline.chance_pass(&e, self.pass), self.rng);
+                    if plays
+                        && e.midi.is_none()
+                        && e.cue.is_none()
+                        && let Some(transform) = self.sequence_transform.as_mut()
+                    {
+                        match transform.note(&e, &self.sequence_transform_context) {
+                            Some(velocity) => e.velocity = velocity.clamp(1, 127),
+                            None => plays = false,
+                        }
+                    }
                     #[cfg(test)]
                     self.fired.push((self.time, e.tick, e.sound, e.pitch, plays));
                     if plays {
@@ -7124,6 +7159,35 @@ mod tests {
         assert!(out[0] > 0.0, "generated note sounds");
         assert!(e.played_notes().iter().any(|note| note.sound == 0));
         assert!(e.take_recorded().is_empty(), "fill does not write a recorded note");
+    }
+
+    #[test]
+    fn sequence_transform_changes_only_sequenced_notes_and_keeps_expression() {
+        struct Variation;
+        impl SequenceTransform for Variation {
+            fn note(&mut self, note: &NoteEvent, context: &[u64; 16]) -> Option<i64> {
+                assert_eq!(context[0], 42);
+                assert!(note.expr.is_some());
+                assert_ne!(note.pitch, 65, "a probability-zero note must not reach the hook");
+                (note.pitch != 64).then_some(23)
+            }
+        }
+        let mut silent = note_at(0, PPQ, 65, Some(0));
+        silent.probability = 0;
+        let notes = vec![note_at(0, PPQ, 60, Some(0)), note_at(0, PPQ, 64, Some(0)), silent];
+        let expression = deckard_model::Expression { pitch: curve(&[(0, 12.0)]), ..Default::default() };
+        let (mut e, rx) = mpe_engine(notes, vec![expression]);
+        let mut context = [0; 16];
+        context[0] = 42;
+        e.set_sequence_transform_context(context);
+        assert!(e.set_sequence_transform(Some(Box::new(Variation))).is_none());
+        e.schedule(0, Live::NoteOn { group: 0, sound: 0, pitch: 72, velocity: 91, length: PPQ });
+        let messages = sent(&mut e, &rx, 1);
+        assert!(messages.iter().any(|m| m[0] & 0xf0 == 0x90 && m[1..] == [60, 23]), "changed velocity: {messages:?}");
+        assert!(!messages.iter().any(|m| m[0] & 0xf0 == 0x90 && m[1] == 64), "suppressed note: {messages:?}");
+        assert!(messages.iter().any(|m| m[0] & 0xf0 == 0x90 && m[1..] == [72, 91]), "live note unchanged: {messages:?}");
+        assert!(messages.iter().any(|m| m[0] & 0xf0 == 0xe0 && (m[1], m[2]) != (0, 64)), "expression reaches MIDI: {messages:?}");
+        assert!(e.set_sequence_transform(None).is_some());
     }
 
     #[test]
