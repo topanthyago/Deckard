@@ -1992,6 +1992,7 @@ pub struct Engine {
     gate_sounds: Option<u32>,
     sequence_transform: Option<Box<dyn SequenceTransform>>,
     sequence_transform_context: [u64; 16],
+    sequence_pitch_shift: Option<(usize, usize, i64)>,
     played_notes: Vec<PlayedNote>,
     played_notes_overflow: bool,
     trace_notes: bool,
@@ -2821,6 +2822,7 @@ impl Engine {
             gate_sounds: None,
             sequence_transform: None,
             sequence_transform_context: [0; 16],
+            sequence_pitch_shift: None,
             played_notes: Vec::with_capacity(project.groups.iter().map(|g| g.sounds.len()).sum::<usize>().saturating_mul(16).max(2048)),
             played_notes_overflow: false,
             trace_notes: false,
@@ -3334,6 +3336,12 @@ impl Engine {
     /// Replace the transform's small copy-only context without allocation.
     pub fn set_sequence_transform_context(&mut self, context: [u64; 16]) {
         self.sequence_transform_context = context;
+    }
+
+    /// Transpose sequenced notes of one sound while leaving stored notes and
+    /// live input unchanged. Callers may transpose their live notes separately.
+    pub fn set_sequence_pitch_shift(&mut self, group: Option<usize>, sound: usize, semitones: i64) {
+        self.sequence_pitch_shift = group.filter(|_| semitones != 0).map(|g| (g, sound, semitones.clamp(-127, 127)));
     }
 
     /// Absolute output frame at the beginning of the next process call.
@@ -4916,6 +4924,14 @@ impl Engine {
                             Some(velocity) => e.velocity = velocity.clamp(1, 127),
                             None => plays = false,
                         }
+                    }
+                    if plays
+                        && e.midi.is_none()
+                        && e.cue.is_none()
+                        && let Some((group, sound, shift)) = self.sequence_pitch_shift
+                        && (e.group, e.sound) == (group, sound)
+                    {
+                        e.pitch = e.pitch.saturating_add(shift).clamp(0, 127);
                     }
                     #[cfg(test)]
                     self.fired.push((self.time, e.tick, e.sound, e.pitch, plays));
@@ -7188,6 +7204,18 @@ mod tests {
         assert!(messages.iter().any(|m| m[0] & 0xf0 == 0x90 && m[1..] == [72, 91]), "live note unchanged: {messages:?}");
         assert!(messages.iter().any(|m| m[0] & 0xf0 == 0xe0 && (m[1], m[2]) != (0, 64)), "expression reaches MIDI: {messages:?}");
         assert!(e.set_sequence_transform(None).is_some());
+    }
+
+    #[test]
+    fn sequence_pitch_shift_keeps_expression_and_live_pitch() {
+        let expression = deckard_model::Expression { pitch: curve(&[(0, 12.0)]), ..Default::default() };
+        let (mut e, rx) = mpe_engine(vec![note_at(0, PPQ, 60, Some(0))], vec![expression]);
+        e.set_sequence_pitch_shift(Some(0), 0, 3);
+        e.schedule(0, Live::NoteOn { group: 0, sound: 0, pitch: 72, velocity: 91, length: PPQ });
+        let messages = sent(&mut e, &rx, 1);
+        assert!(messages.iter().any(|m| m[0] & 0xf0 == 0x90 && m[1..] == [63, 100]), "shifted sequence: {messages:?}");
+        assert!(messages.iter().any(|m| m[0] & 0xf0 == 0x90 && m[1..] == [72, 91]), "live pitch unchanged: {messages:?}");
+        assert!(messages.iter().any(|m| m[0] & 0xf0 == 0xe0 && (m[1], m[2]) != (0, 64)), "expression preserved: {messages:?}");
     }
 
     #[test]
