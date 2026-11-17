@@ -572,8 +572,7 @@ fn ev_loop(dev: &mut dyn Maschine, mhandler: &mut MHandler, dev_path: &str) {
                                 led_pending = Some(Instant::now());
                             }
                             mhandler.pad_colors[pad] = color;
-                            let shown = if mhandler.pad_held[pad] { pressed_pad_color(color) } else { color };
-                            dev.set_pad_light(pad, shown, 1.0);
+                            dev.set_pad_light(pad, color, 1.0);
                         } else if let Some((start, rgb)) = deckard_group_indicator(&bytes) {
                             midi_led_changed = true;
                             if led_latency_log && led_pending.is_none() {
@@ -1024,6 +1023,7 @@ impl<'a> MHandler<'a> {
                 self.pad_note_down[pad] = false;
             }
             if self.pad_held[pad] {
+                self.send_midi(&Message::NoteOff(Ch1, dev.get_midi_note_base() + self.pad_notes[pad], 0));
                 dev.set_pad_light(pad, self.pad_colors[pad], 1.0);
                 self.pad_held[pad] = false;
             }
@@ -1055,6 +1055,13 @@ impl<'a> MHandler<'a> {
             PressureShape::Exponential(power) => pressure.powf(power),
             PressureShape::Constant(c_pressure) => c_pressure,
         } * 127.0) as U7
+    }
+
+    fn controls_note_repeat(&self) -> bool {
+        self.external_pad_leds
+            && self.pad_mode == 1
+            && self.pad_modifiers == 0
+            && self.button_held[42]
     }
 
     fn recv_osc_msg(&self, maschine: &mut dyn Maschine) {
@@ -1430,9 +1437,6 @@ impl<'a> MaschineHandler for MHandler<'a> {
             self.pad_note_down[pad_idx] = true;
         }
         self.pad_held[pad_idx] = true;
-        // Show the touch immediately using Deckard's last colour; the app's
-        // next state update remains authoritative for the base colour.
-        maschine.set_pad_light(pad_idx, pressed_pad_color(self.pad_colors[pad_idx]), 1.0);
         if !self.external_pad_leds {
             maschine.set_pad_light(pad_idx, self.pad_color(), pressure.sqrt());
         }
@@ -1444,7 +1448,8 @@ impl<'a> MaschineHandler for MHandler<'a> {
             _ => {}
         }
 
-        if !self.send_aftertouch {
+        let controls_pressure = self.controls_note_repeat() && self.pad_held[pad_idx];
+        if !self.send_aftertouch && !controls_pressure {
             return;
         }
 
@@ -1473,6 +1478,9 @@ impl<'a> MaschineHandler for MHandler<'a> {
         let midi_note = maschine.get_midi_note_base() + self.pad_notes[pad_idx];
         let msg = Message::PolyphonicPressure(Ch1, midi_note, value);
 
+        if controls_pressure {
+            self.send_midi(&msg);
+        }
         if self.pad_note_down[pad_idx] {
             self.send_drum(&msg);
         }
@@ -1820,6 +1828,18 @@ mod tests {
             at_last_sent: [None; 16],
         };
         let mut dev = devices::mk2::Mikro::new(-1);
+        assert!(!handler.controls_note_repeat());
+        handler.pad_mode = 1;
+        handler.button_held[42] = true;
+        assert!(handler.controls_note_repeat());
+        handler.pad_modifiers = 1;
+        assert!(!handler.controls_note_repeat());
+        handler.pad_modifiers = 0;
+        handler.external_pad_leds = false;
+        assert!(!handler.controls_note_repeat());
+        handler.external_pad_leds = true;
+        handler.button_held[42] = false;
+        handler.pad_mode = 0;
         handler.pad_pressed(&mut dev, 0, 1.0);
         assert!(handler.pad_note_down[0]);
         assert!(handler.pad_held[0]);
