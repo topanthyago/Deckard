@@ -1050,6 +1050,10 @@ impl<'a> MHandler<'a> {
     }
 
     fn pressure_to_vel(&self, pressure: f32) -> U7 {
+        // Controls mode delegates the response curve to the application.
+        if self.external_pad_leds && self.pad_mode == 1 {
+            return (pressure.clamp(0.0, 1.0) * 127.0).round().max(1.0) as U7;
+        }
         (match self.pressure_shape {
             PressureShape::Linear => pressure,
             PressureShape::Exponential(power) => pressure.powf(power),
@@ -1832,6 +1836,13 @@ mod tests {
         handler.pad_mode = 1;
         handler.button_held[42] = true;
         assert!(handler.controls_note_repeat());
+        handler.pressure_shape = PressureShape::Exponential(0.4);
+        assert_eq!(handler.pressure_to_vel(0.25), 32);
+        assert_eq!(handler.pressure_to_vel(0.0), 1);
+        handler.pad_mode = 0;
+        assert!(handler.pressure_to_vel(0.25) > 32);
+        handler.pad_mode = 1;
+        handler.pressure_shape = PressureShape::Linear;
         handler.pad_modifiers = 1;
         assert!(!handler.controls_note_repeat());
         handler.pad_modifiers = 0;
